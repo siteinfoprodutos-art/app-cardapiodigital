@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { CustomerMenuView } from './components/CustomerMenuView';
+import { OrderTrackingView } from './components/OrderTrackingView';
 import { OwnerPanelView } from './components/OwnerPanelView';
 import { RegistrationView } from './components/RegistrationView';
 import { StoreDirectoryView } from './components/StoreDirectoryView';
@@ -9,10 +10,14 @@ function normalizePathname(raw: string): string {
   return clean || '/';
 }
 
+const PEDIDO_ROUTE_REGEX = /^\/pedido\/([^/]+)$/;
 const VALID_SLUG_REGEX = /^\/[a-zA-Z0-9_-]+$/;
 
 function isKnownRoute(path: string): boolean {
   if (path === '/' || path === '/cadastro' || path === '/painel' || path === '/admin') {
+    return true;
+  }
+  if (PEDIDO_ROUTE_REGEX.test(path)) {
     return true;
   }
   return VALID_SLUG_REGEX.test(path);
@@ -65,6 +70,17 @@ export default function App() {
     return <OwnerPanelView onNavigate={navigate} />;
   }
 
+  const pedidoMatch = PEDIDO_ROUTE_REGEX.exec(pathname);
+  if (pedidoMatch) {
+    let decodedToken = pedidoMatch[1];
+    try {
+      decodedToken = decodeURIComponent(pedidoMatch[1]);
+    } catch {
+      decodedToken = pedidoMatch[1];
+    }
+    return <OrderTrackingView token={decodedToken} />;
+  }
+
   const slug = pathname.slice(1);
-  return <CustomerMenuView slug={slug} />;
+  return <CustomerMenuView slug={slug} onNavigate={navigate} />;
 }

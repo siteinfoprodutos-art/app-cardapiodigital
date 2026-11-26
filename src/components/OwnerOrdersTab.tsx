@@ -3,8 +3,12 @@ import {
   ArrowRight,
   Ban,
   Check,
+  CheckCircle2,
+  ChevronDown,
   Clock,
   CreditCard,
+  FileImage,
+  Loader2,
   MapPin,
   MessageCircle,
   PackageCheck,
@@ -14,8 +18,11 @@ import {
   ShoppingBag,
   Store,
   Truck,
+  X,
 } from 'lucide-react';
+import { createComprovanteSignedUrl } from '../lib/supabase';
 import {
+  buildCustomerStageWhatsAppUrl,
   formatBRL,
   formatSaoPauloDateTime,
   formatSaoPauloTime,
@@ -26,6 +33,7 @@ import {
   type PedidoItem,
   type PedidoStatus,
   shiftDateKey,
+  type WhatsAppNotifyStage,
 } from '../types/menu';
 
 export type OrderDateFilter = 'hoje' | 'ontem' | '7dias' | 'todos';
@@ -37,8 +45,8 @@ interface OwnerOrdersTabProps {
   newlyArrivedIds: Set<string>;
   updatingOrderId: string | null;
   onRefresh: () => void;
-  onUpdateStatus: (pedidoId: string, nextStatus: PedidoStatus) => Promise<void>;
-  onTogglePaid: (pedidoId: string, nextPaid: boolean) => Promise<void>;
+  onUpdateStatus: (pedidoId: string, nextStatus: PedidoStatus) => Promise<boolean>;
+  onTogglePaid: (pedidoId: string, nextPaid: boolean) => Promise<boolean>;
   onPrintPedido: (pedido: Pedido) => void;
 }
 
@@ -51,8 +59,12 @@ const STATUS_BADGE_MAP: Record<
     className: 'bg-sky-100 text-sky-900 border-sky-200',
   },
   em_preparo: {
-    label: 'Em preparo',
+    label: 'Em preparação',
     className: 'bg-amber-100 text-amber-900 border-amber-200',
+  },
+  pronto: {
+    label: 'Pedido pronto',
+    className: 'bg-cyan-100 text-cyan-900 border-cyan-200',
   },
   saiu_entrega: {
     label: 'Saiu para entrega',
@@ -72,19 +84,51 @@ const STATUS_BADGE_MAP: Record<
   },
 };
 
+function getStagesForOrder(tipo: Pedido['tipo']): Array<{
+  status: PedidoStatus;
+  label: string;
+}> {
+  if (tipo === 'retirada') {
+    return [
+      { status: 'em_preparo', label: 'Em preparação' },
+      { status: 'pronto_retirada', label: 'Pronto para retirada' },
+      { status: 'entregue', label: 'Retirado' },
+    ];
+  }
+  return [
+    { status: 'em_preparo', label: 'Em preparação' },
+    { status: 'pronto', label: 'Pedido pronto' },
+    { status: 'saiu_entrega', label: 'Saiu para entrega' },
+    { status: 'entregue', label: 'Entregue' },
+  ];
+}
+
 function getNextStatusAction(pedido: Pedido): {
   nextStatus: PedidoStatus;
   label: string;
 } | null {
+  if (pedido.tipo === 'retirada') {
+    switch (pedido.status) {
+      case 'novo':
+        return { nextStatus: 'em_preparo', label: 'Em preparação' };
+      case 'em_preparo':
+      case 'pronto':
+        return { nextStatus: 'pronto_retirada', label: 'Pronto para retirada' };
+      case 'pronto_retirada':
+        return { nextStatus: 'entregue', label: 'Retirado' };
+      default:
+        return null;
+    }
+  }
+
   switch (pedido.status) {
     case 'novo':
-      return { nextStatus: 'em_preparo', label: 'Em preparo' };
+      return { nextStatus: 'em_preparo', label: 'Em preparação' };
     case 'em_preparo':
-      return pedido.tipo === 'retirada'
-        ? { nextStatus: 'pronto_retirada', label: 'Pronto para retirada' }
-        : { nextStatus: 'saiu_entrega', label: 'Saiu para entrega' };
+      return { nextStatus: 'pronto', label: 'Pedido pronto' };
+    case 'pronto':
+      return { nextStatus: 'saiu_entrega', label: 'Saiu para entrega' };
     case 'saiu_entrega':
-    case 'pronto_retirada':
       return { nextStatus: 'entregue', label: 'Entregue' };
     default:
       return null;
@@ -133,6 +177,22 @@ export function OwnerOrdersTab({
 }: OwnerOrdersTabProps) {
   const [dateFilter, setDateFilter] = useState<OrderDateFilter>('hoje');
   const [confirmCancelId, setConfirmCancelId] = useState<string | null>(null);
+  const [openStagesMenuId, setOpenStagesMenuId] = useState<string | null>(null);
+
+  // Prompt "Quer avisar o cliente?" após confirmação de pagamento ou mudança de etapa
+  const [notifyPrompt, setNotifyPrompt] = useState<{
+    pedidoId: string;
+    stage: WhatsAppNotifyStage;
+    description: string;
+  } | null>(null);
+
+  // Modal do comprovante Pix
+  const [receiptModal, setReceiptModal] = useState<{
+    pedido: Pedido;
+    signedUrl: string | null;
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
 
   const todayKey = getSaoPauloDateKey(new Date());
   const yesterdayKey = shiftDateKey(todayKey, -1);
@@ -195,6 +255,65 @@ export function OwnerOrdersTab({
     todos: 'Nenhum pedido recebido até o momento.',
   };
 
+  const handleStageChange = async (pedido: Pedido, nextStatus: PedidoStatus) => {
+    setOpenStagesMenuId(null);
+    const ok = await onUpdateStatus(pedido.id, nextStatus);
+    if (ok && normalizeWhatsAppDigits(pedido.telefone || '')) {
+      setNotifyPrompt({
+        pedidoId: pedido.id,
+        stage: nextStatus,
+        description:
+          nextStatus === 'cancelado'
+            ? 'Pedido cancelado.'
+            : 'Etapa atualizada.',
+      });
+    }
+  };
+
+  const handlePaymentConfirm = async (pedido: Pedido, nextPaid: boolean) => {
+    const ok = await onTogglePaid(pedido.id, nextPaid);
+    if (ok && nextPaid && normalizeWhatsAppDigits(pedido.telefone || '')) {
+      setNotifyPrompt({
+        pedidoId: pedido.id,
+        stage: 'pago',
+        description: 'Pagamento confirmado!',
+      });
+    }
+    return ok;
+  };
+
+  const handleOpenReceiptModal = async (pedido: Pedido) => {
+    if (!pedido.comprovante_path) return;
+    setReceiptModal({
+      pedido,
+      signedUrl: null,
+      loading: true,
+      error: null,
+    });
+
+    try {
+      const url = await createComprovanteSignedUrl(pedido.comprovante_path, 300);
+      setReceiptModal((prev) =>
+        prev && prev.pedido.id === pedido.id
+          ? { ...prev, signedUrl: url, loading: false, error: null }
+          : prev
+      );
+    } catch (err) {
+      setReceiptModal((prev) =>
+        prev && prev.pedido.id === pedido.id
+          ? {
+              ...prev,
+              loading: false,
+              error:
+                err instanceof Error
+                  ? err.message
+                  : 'Não foi possível carregar o comprovante.',
+            }
+          : prev
+      );
+    }
+  };
+
   return (
     <div className="space-y-5">
       {/* Cabeçalho e Filtros */}
@@ -202,7 +321,7 @@ export function OwnerOrdersTab({
         <div>
           <h1 className="text-xl font-bold text-slate-900">Pedidos Recebidos</h1>
           <p className="text-sm text-slate-600">
-            Acompanhe novos pedidos, atualize o andamento e controle os pagamentos.
+            Acompanhe novos pedidos, atualize o andamento, confira comprovantes Pix e avise o cliente.
           </p>
         </div>
 
@@ -287,21 +406,50 @@ export function OwnerOrdersTab({
       ) : (
         <div className="space-y-4">
           {filteredPedidos.map((pedido) => {
-            const statusInfo = STATUS_BADGE_MAP[pedido.status] || {
+            const rawStatusInfo = STATUS_BADGE_MAP[pedido.status] || {
               label: pedido.status || 'Novo',
               className: 'bg-slate-100 text-slate-800 border-slate-200',
             };
+            const statusLabel =
+              pedido.status === 'entregue' && pedido.tipo === 'retirada'
+                ? 'Retirado'
+                : rawStatusInfo.label;
+
             const nextAction = getNextStatusAction(pedido);
+            const allStages = getStagesForOrder(pedido.tipo);
+            const otherStages = allStages.filter(
+              (s) => s.status !== pedido.status && s.status !== nextAction?.nextStatus
+            );
+
             const isUpdating = updatingOrderId === pedido.id;
             const isCancelled = pedido.status === 'cancelado';
             const isNewHighlight =
               pedido.status === 'novo' || newlyArrivedIds.has(pedido.id);
-            const phoneDigits = normalizeWhatsAppDigits(pedido.telefone || '');
-            const clienteWhatsappUrl = phoneDigits
-              ? `https://wa.me/${phoneDigits}?text=${encodeURIComponent(
-                  `Olá ${pedido.cliente}, tudo bem? Sobre o Pedido #${pedido.numero} em ${estabelecimentoNome}: `
-                )}`
+            const hasReceipt = Boolean((pedido.comprovante_path || '').trim());
+            const hasPendingReceipt = hasReceipt && !pedido.pago;
+
+            const currentStageWhatsappUrl = buildCustomerStageWhatsAppUrl({
+              telefone: pedido.telefone,
+              clienteNome: pedido.cliente,
+              numero: pedido.numero,
+              estabelecimentoNome,
+              stage: pedido.status,
+              token: pedido.token,
+            });
+
+            const activePrompt =
+              notifyPrompt && notifyPrompt.pedidoId === pedido.id ? notifyPrompt : null;
+            const promptWhatsappUrl = activePrompt
+              ? buildCustomerStageWhatsAppUrl({
+                  telefone: pedido.telefone,
+                  clienteNome: pedido.cliente,
+                  numero: pedido.numero,
+                  estabelecimentoNome,
+                  stage: activePrompt.stage,
+                  token: pedido.token,
+                })
               : null;
+
             const items = normalizeOrderItems(pedido.itens);
 
             return (
@@ -312,6 +460,8 @@ export function OwnerOrdersTab({
                     ? 'border-rose-200/80 opacity-75'
                     : isNewHighlight
                     ? 'border-sky-300 ring-1 ring-sky-200'
+                    : hasPendingReceipt
+                    ? 'border-violet-300 ring-1 ring-violet-200'
                     : 'border-slate-200'
                 }`}
               >
@@ -324,9 +474,9 @@ export function OwnerOrdersTab({
                       </span>
 
                       <span
-                        className={`px-2.5 py-0.5 rounded-full text-xs font-bold border ${statusInfo.className}`}
+                        className={`px-2.5 py-0.5 rounded-full text-xs font-bold border ${rawStatusInfo.className}`}
                       >
-                        {statusInfo.label}
+                        {statusLabel}
                       </span>
 
                       {newlyArrivedIds.has(pedido.id) && pedido.status !== 'novo' && (
@@ -344,6 +494,12 @@ export function OwnerOrdersTab({
                       >
                         {pedido.pago ? 'Pago' : 'A receber'}
                       </span>
+
+                      {hasPendingReceipt && (
+                        <span className="px-2.5 py-0.5 rounded-full text-xs font-bold border bg-violet-100 text-violet-900 border-violet-200">
+                          Comprovante recebido
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
@@ -377,7 +533,22 @@ export function OwnerOrdersTab({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {hasReceipt && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenReceiptModal(pedido)}
+                        className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-bold inline-flex items-center gap-1.5 transition-colors ${
+                          hasPendingReceipt
+                            ? 'bg-violet-700 hover:bg-violet-800 text-white shadow-xs'
+                            : 'border border-slate-200 bg-white hover:bg-slate-50 text-slate-700'
+                        }`}
+                      >
+                        <FileImage className="w-3.5 h-3.5" />
+                        <span>Ver comprovante</span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={() => onPrintPedido(pedido)}
@@ -391,7 +562,7 @@ export function OwnerOrdersTab({
 
                 {/* Cliente & Endereço */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-                  <div className="space-y-1">
+                  <div className="space-y-1.5">
                     <p className="font-bold text-slate-900">{pedido.cliente}</p>
                     {pedido.telefone && pedido.telefone.trim() && (
                       <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
@@ -399,15 +570,15 @@ export function OwnerOrdersTab({
                           <Phone className="w-3.5 h-3.5 text-slate-400" />
                           <span>{pedido.telefone}</span>
                         </span>
-                        {clienteWhatsappUrl && (
+                        {currentStageWhatsappUrl && (
                           <a
-                            href={clienteWhatsappUrl}
+                            href={currentStageWhatsappUrl}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold inline-flex items-center gap-1 transition-colors"
                           >
                             <MessageCircle className="w-3 h-3" />
-                            <span>Chamar no WhatsApp</span>
+                            <span>Avisar cliente no WhatsApp</span>
                           </a>
                         )}
                       </div>
@@ -426,6 +597,38 @@ export function OwnerOrdersTab({
                     </div>
                   )}
                 </div>
+
+                {/* Prompt contextual pós-ação: Quer avisar o cliente? */}
+                {activePrompt && promptWhatsappUrl && (
+                  <div
+                    role="status"
+                    className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 flex flex-wrap items-center justify-between gap-3"
+                  >
+                    <div className="flex items-center gap-2 text-xs font-semibold text-emerald-950">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                      <span>{activePrompt.description} Quer avisar o cliente?</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <a
+                        href={promptWhatsappUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => setNotifyPrompt(null)}
+                        className="min-h-[34px] px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-xs"
+                      >
+                        <MessageCircle className="w-3.5 h-3.5" />
+                        <span>Avisar no WhatsApp</span>
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => setNotifyPrompt(null)}
+                        className="min-h-[34px] px-2.5 py-1 rounded-lg text-xs font-semibold text-emerald-900 hover:bg-emerald-100"
+                      >
+                        Agora não
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 {/* Itens do Pedido */}
                 <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5 space-y-2">
@@ -478,20 +681,55 @@ export function OwnerOrdersTab({
                   </div>
                 </div>
 
-                {/* Ações: Avançar Status, Marcar como Pago, Cancelar */}
+                {/* Ações: Próxima etapa destacada + Menu de etapas + Marcar como pago + Cancelar */}
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                   <div className="flex flex-wrap items-center gap-2">
                     {nextAction && !isCancelled && (
                       <button
                         type="button"
                         disabled={isUpdating}
-                        onClick={() => onUpdateStatus(pedido.id, nextAction.nextStatus)}
+                        onClick={() => handleStageChange(pedido, nextAction.nextStatus)}
                         className="min-h-[40px] px-4 py-2 rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 text-xs font-bold inline-flex items-center gap-1.5 shadow-xs"
                       >
                         <PackageCheck className="w-4 h-4" />
-                        <span>Avançar para: {nextAction.label}</span>
+                        <span>{nextAction.label}</span>
                         <ArrowRight className="w-3.5 h-3.5" />
                       </button>
+                    )}
+
+                    {!isCancelled && otherStages.length > 0 && (
+                      <div className="relative">
+                        <button
+                          type="button"
+                          disabled={isUpdating}
+                          onClick={() =>
+                            setOpenStagesMenuId((prev) =>
+                              prev === pedido.id ? null : pedido.id
+                            )
+                          }
+                          aria-expanded={openStagesMenuId === pedido.id}
+                          className="min-h-[40px] px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-50 text-xs font-semibold text-slate-700 inline-flex items-center gap-1.5"
+                        >
+                          <span>Outras etapas</span>
+                          <ChevronDown className="w-3.5 h-3.5" />
+                        </button>
+
+                        {openStagesMenuId === pedido.id && (
+                          <div className="absolute left-0 mt-1.5 z-20 min-w-[200px] bg-white border border-slate-200 rounded-xl shadow-lg py-1">
+                            {otherStages.map((stage) => (
+                              <button
+                                key={stage.status}
+                                type="button"
+                                disabled={isUpdating}
+                                onClick={() => handleStageChange(pedido, stage.status)}
+                                className="w-full px-3.5 py-2 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50 flex items-center justify-between"
+                              >
+                                <span>{stage.label}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     )}
 
                     {!isCancelled && (
@@ -504,7 +742,7 @@ export function OwnerOrdersTab({
                             type="button"
                             disabled={isUpdating}
                             onClick={async () => {
-                              await onUpdateStatus(pedido.id, 'cancelado');
+                              await handleStageChange(pedido, 'cancelado');
                               setConfirmCancelId(null);
                             }}
                             className="min-h-[30px] px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold disabled:opacity-50"
@@ -527,7 +765,7 @@ export function OwnerOrdersTab({
                           className="min-h-[40px] px-3.5 py-2 rounded-xl border border-rose-200 text-rose-700 hover:bg-rose-50 disabled:opacity-50 text-xs font-semibold inline-flex items-center gap-1.5"
                         >
                           <Ban className="w-3.5 h-3.5" />
-                          <span>Cancelar</span>
+                          <span>Cancelar pedido</span>
                         </button>
                       )
                     )}
@@ -539,7 +777,7 @@ export function OwnerOrdersTab({
                     role="switch"
                     aria-checked={pedido.pago}
                     disabled={isUpdating}
-                    onClick={() => onTogglePaid(pedido.id, !pedido.pago)}
+                    onClick={() => handlePaymentConfirm(pedido, !pedido.pago)}
                     className="min-h-[40px] px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 disabled:opacity-50 inline-flex items-center gap-2.5 text-xs font-semibold text-slate-800"
                   >
                     <span
@@ -562,6 +800,101 @@ export function OwnerOrdersTab({
               </article>
             );
           })}
+        </div>
+      )}
+
+      {/* Modal de Conferência do Comprovante Pix */}
+      {receiptModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setReceiptModal(null)}
+        >
+          <div
+            className="w-full max-w-lg bg-white rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-bold text-slate-900">
+                  Comprovante Pix — Pedido #{receiptModal.pedido.numero}
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Cliente: {receiptModal.pedido.cliente}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReceiptModal(null)}
+                aria-label="Fechar comprovante"
+                className="w-9 h-9 rounded-xl text-slate-500 hover:bg-slate-100 flex items-center justify-center"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 overflow-y-auto space-y-4">
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-600">
+                  Valor esperado do pedido
+                </span>
+                <span className="text-lg font-bold text-slate-900 tabular-nums">
+                  {formatBRL(Number(receiptModal.pedido.total) || 0)}
+                </span>
+              </div>
+
+              {receiptModal.loading ? (
+                <div className="py-12 text-center space-y-2">
+                  <Loader2 className="w-7 h-7 animate-spin text-slate-500 mx-auto" />
+                  <p className="text-xs text-slate-500">Carregando imagem do comprovante...</p>
+                </div>
+              ) : receiptModal.error ? (
+                <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-800">
+                  {receiptModal.error}
+                </div>
+              ) : receiptModal.signedUrl ? (
+                <div className="rounded-xl border border-slate-200 bg-slate-100 overflow-hidden flex items-center justify-center">
+                  <img
+                    src={receiptModal.signedUrl}
+                    alt={`Comprovante do pedido #${receiptModal.pedido.numero}`}
+                    className="max-h-[55vh] w-auto object-contain"
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            <div className="px-5 py-4 border-t border-slate-200 bg-slate-50 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setReceiptModal(null)}
+                className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100"
+              >
+                Fechar
+              </button>
+
+              {!receiptModal.pedido.pago ? (
+                <button
+                  type="button"
+                  disabled={updatingOrderId === receiptModal.pedido.id}
+                  onClick={async () => {
+                    const targetPedido = receiptModal.pedido;
+                    const ok = await handlePaymentConfirm(targetPedido, true);
+                    if (ok) {
+                      setReceiptModal(null);
+                    }
+                  }}
+                  className="min-h-[42px] px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs sm:text-sm font-bold inline-flex items-center gap-1.5 shadow-xs"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Confirmar pagamento</span>
+                </button>
+              ) : (
+                <span className="px-3 py-2 rounded-xl bg-emerald-100 text-emerald-900 text-xs font-bold inline-flex items-center gap-1.5">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Pagamento já confirmado</span>
+                </span>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

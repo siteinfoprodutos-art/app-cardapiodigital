@@ -55,10 +55,12 @@ import { ImageWithFallback } from './ImageWithFallback';
 
 interface CustomerMenuViewProps {
   slug: string;
+  onNavigate?: (path: string) => void;
 }
 
 interface ConfirmedOrderState {
   numero: number;
+  token?: string | null;
   subtotal: number;
   taxa_entrega: number;
   total: number;
@@ -70,7 +72,14 @@ interface ConfirmedOrderState {
   enderecoTexto?: string;
 }
 
+interface StoredLastOrder {
+  token: string;
+  numero: number;
+  savedAt: number;
+}
+
 const CART_STORAGE_KEY = 'cardapio_cart_v1_';
+const LAST_ORDER_STORAGE_KEY = 'cardapio_last_order_v1_';
 
 function MenuSkeleton() {
   return (
@@ -120,7 +129,7 @@ function MenuSkeleton() {
   );
 }
 
-export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
+export function CustomerMenuView({ slug, onNavigate }: CustomerMenuViewProps) {
   const [estabelecimento, setEstabelecimento] = useState<Estabelecimento | null>(null);
   const [categorias, setCategorias] = useState<Categoria[]>([]);
   const [produtos, setProdutos] = useState<Produto[]>([]);
@@ -138,6 +147,24 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
 
   // Carrinho persistente no localStorage
   const storageKey = `${CART_STORAGE_KEY}${slug}`;
+  const lastOrderStorageKey = `${LAST_ORDER_STORAGE_KEY}${slug}`;
+  const [lastOrder, setLastOrder] = useState<StoredLastOrder | null>(() => {
+    try {
+      const saved = localStorage.getItem(`${LAST_ORDER_STORAGE_KEY}${slug}`);
+      if (!saved) return null;
+      const parsed = JSON.parse(saved) as StoredLastOrder;
+      if (
+        parsed?.token &&
+        typeof parsed.numero === 'number' &&
+        Date.now() - (parsed.savedAt || 0) < 24 * 60 * 60 * 1000
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Ignorar erro de parse
+    }
+    return null;
+  });
   const [cart, setCart] = useState<CartItem[]>(() => {
     try {
       const saved = localStorage.getItem(`${CART_STORAGE_KEY}${slug}`);
@@ -178,6 +205,18 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
   const lastQueriedCepRef = useRef<string>('');
   const ruaInputRef = useRef<HTMLInputElement>(null);
   const numeroInputRef = useRef<HTMLInputElement>(null);
+
+  const goToOrderTracking = (token: string) => {
+    const cleanToken = token.trim();
+    if (!cleanToken) return;
+    const path = `/pedido/${cleanToken}`;
+    if (onNavigate) {
+      onNavigate(path);
+    } else {
+      window.history.pushState({}, '', path);
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }
+  };
 
   useEffect(() => {
     try {
@@ -746,7 +785,7 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
     }));
 
     try {
-      const { data, error } = await supabase.rpc('criar_pedido', {
+      const { data, error } = await supabase.rpc('criar_pedido_v2', {
         p_estabelecimento: estabelecimento.id,
         p_cliente: clienteNome.trim(),
         p_telefone: clienteTelefone.trim(),
@@ -759,7 +798,7 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
       });
 
       if (error) {
-        console.error('Erro RPC criar_pedido:', error);
+        console.error('Erro RPC criar_pedido_v2:', error);
         setCheckoutError(
           translateSupabaseError(error, 'Não foi possível registrar seu pedido. Tente novamente.')
         );
@@ -770,6 +809,25 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
       if (!rawResult || rawResult.numero === undefined || rawResult.numero === null) {
         setCheckoutError('Resposta inesperada ao registrar pedido. Tente novamente.');
         return;
+      }
+
+      const orderToken = rawResult.token ? String(rawResult.token).trim() : null;
+      const trackingUrl = orderToken
+        ? `${window.location.origin}/pedido/${orderToken}`
+        : null;
+
+      if (orderToken) {
+        const stored: StoredLastOrder = {
+          token: orderToken,
+          numero: Number(rawResult.numero),
+          savedAt: Date.now(),
+        };
+        setLastOrder(stored);
+        try {
+          localStorage.setItem(lastOrderStorageKey, JSON.stringify(stored));
+        } catch {
+          // Ignorar erro de storage
+        }
       }
 
       const rawItens = Array.isArray(rawResult.itens) ? rawResult.itens : [];
@@ -829,10 +887,12 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
         enderecoTexto: enderecoFinal,
         obsPedido: pedidoObs.trim(),
         formaPagamento,
+        trackingUrl,
       });
 
       setConfirmedOrder({
         numero: Number(rawResult.numero),
+        token: orderToken,
         subtotal: finalSubtotal,
         taxa_entrega: finalTaxa,
         total: finalTotal,
@@ -1027,6 +1087,23 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
                   )}
                 </div>
               )}
+
+            {lastOrder && (
+              <div className="pt-2">
+                <button
+                  type="button"
+                  onClick={() => goToOrderTracking(lastOrder.token)}
+                  className="min-h-[40px] px-4 py-2 rounded-xl text-xs font-bold inline-flex items-center gap-2 shadow-xs transition-transform active:scale-[0.98]"
+                  style={{
+                    backgroundColor: 'var(--menu-accent)',
+                    color: 'var(--menu-accent-text)',
+                  }}
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                  <span>Acompanhar meu pedido #{lastOrder.numero}</span>
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </header>
@@ -1430,6 +1507,24 @@ export function CustomerMenuView({ slug }: CustomerMenuViewProps) {
                       </p>
                     </div>
                   </div>
+
+                  {confirmedOrder.token && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsCartOpen(false);
+                        goToOrderTracking(confirmedOrder.token!);
+                      }}
+                      className="w-full min-h-[48px] px-5 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-transform active:scale-[0.98]"
+                      style={{
+                        backgroundColor: 'var(--menu-accent)',
+                        color: 'var(--menu-accent-text)',
+                      }}
+                    >
+                      <Clock className="w-5 h-5" />
+                      <span>Acompanhar meu pedido</span>
+                    </button>
+                  )}
 
                   {confirmedOrder.whatsappUrl && (
                     <a

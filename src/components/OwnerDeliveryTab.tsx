@@ -22,13 +22,16 @@ import {
 import { supabase, translateSupabaseError } from '../lib/supabase';
 import {
   type BairroEntrega,
+  centsToNumber,
   type Estabelecimento,
   formatAreaLabel,
   formatBRL,
   getAreaBairroNome,
   getAreaCidade,
   type ModoEntrega,
+  numberToCents,
 } from '../types/menu';
+import { CurrencyInput } from './CurrencyInput';
 
 interface OwnerDeliveryTabProps {
   estabelecimento: Estabelecimento;
@@ -39,12 +42,12 @@ interface OwnerDeliveryTabProps {
   setDelAceitaRetirada: (val: boolean | ((prev: boolean) => boolean)) => void;
   delModo: ModoEntrega;
   setDelModo: (val: ModoEntrega) => void;
-  delTaxaFixa: string;
-  setDelTaxaFixa: (val: string) => void;
-  delFreteGratis: string;
-  setDelFreteGratis: (val: string) => void;
-  delPedidoMinimo: string;
-  setDelPedidoMinimo: (val: string) => void;
+  delTaxaFixaCents: number;
+  setDelTaxaFixaCents: (val: number) => void;
+  delFreteGratisCents: number | null;
+  setDelFreteGratisCents: (val: number | null) => void;
+  delPedidoMinimoCents: number | null;
+  setDelPedidoMinimoCents: (val: number | null) => void;
   delTempoEstimado: string;
   setDelTempoEstimado: (val: string) => void;
   delSaving: boolean;
@@ -60,11 +63,6 @@ function parseNonNegativeMoney(raw: string): number | null {
   const num = Number(cleaned.replace(/\./g, '').replace(',', '.'));
   if (!Number.isFinite(num) || num < 0) return NaN;
   return num;
-}
-
-function formatMoneyInput(val?: number | null): string {
-  if (val === null || val === undefined || !Number.isFinite(Number(val))) return '';
-  return Number(val).toFixed(2).replace('.', ',');
 }
 
 function normalizeKey(text: string): string {
@@ -92,7 +90,7 @@ interface SuggestedAreaRow {
   bairroNome: string;
   cidade: string;
   distanciaKm: number;
-  taxaInput: string;
+  taxaCents: number;
 }
 
 export function OwnerDeliveryTab({
@@ -104,12 +102,12 @@ export function OwnerDeliveryTab({
   setDelAceitaRetirada,
   delModo,
   setDelModo,
-  delTaxaFixa,
-  setDelTaxaFixa,
-  delFreteGratis,
-  setDelFreteGratis,
-  delPedidoMinimo,
-  setDelPedidoMinimo,
+  delTaxaFixaCents,
+  setDelTaxaFixaCents,
+  delFreteGratisCents,
+  setDelFreteGratisCents,
+  delPedidoMinimoCents,
+  setDelPedidoMinimoCents,
   delTempoEstimado,
   setDelTempoEstimado,
   delSaving,
@@ -121,20 +119,20 @@ export function OwnerDeliveryTab({
   // Formulário individual (Cidade, Bairro, Taxa)
   const [newCidade, setNewCidade] = useState(estabelecimento.cidade || '');
   const [newBairroNome, setNewBairroNome] = useState('');
-  const [newTaxa, setNewTaxa] = useState('');
+  const [newTaxaCents, setNewTaxaCents] = useState<number>(0);
   const [addingArea, setAddingArea] = useState(false);
 
   // Busca & Edição inline
   const [searchQuery, setSearchQuery] = useState('');
   const [inlineFeeId, setInlineFeeId] = useState<string | null>(null);
-  const [inlineFeeValue, setInlineFeeValue] = useState('');
+  const [inlineFeeCents, setInlineFeeCents] = useState<number>(0);
   const [savingInlineId, setSavingInlineId] = useState<string | null>(null);
 
   // Edição completa na linha
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editCidade, setEditCidade] = useState('');
   const [editBairroNome, setEditBairroNome] = useState('');
-  const [editTaxa, setEditTaxa] = useState('');
+  const [editTaxaCents, setEditTaxaCents] = useState<number>(0);
 
   // Exclusão com confirmação inline
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -146,7 +144,7 @@ export function OwnerDeliveryTab({
 
   // Aplicar mesmo valor à cidade inteira
   const [bulkCity, setBulkCity] = useState('');
-  const [bulkCityFee, setBulkCityFee] = useState('');
+  const [bulkCityFeeCents, setBulkCityFeeCents] = useState<number>(0);
   const [bulkCitySaving, setBulkCitySaving] = useState(false);
 
   // Sugestões Overpass (bairros próximos e cidades vizinhas)
@@ -162,9 +160,9 @@ export function OwnerDeliveryTab({
   const [savingSuggestions, setSavingSuggestions] = useState(false);
 
   // Faixas de distância
-  const [tier0to2, setTier0to2] = useState('');
-  const [tier2to5, setTier2to5] = useState('');
-  const [tierAbove5, setTierAbove5] = useState('');
+  const [tier0to2Cents, setTier0to2Cents] = useState<number | null>(null);
+  const [tier2to5Cents, setTier2to5Cents] = useState<number | null>(null);
+  const [tierAbove5Cents, setTierAbove5Cents] = useState<number | null>(null);
 
   const manualCidadeInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -357,14 +355,14 @@ export function OwnerDeliveryTab({
 
     const cleanCidade = newCidade.trim();
     const cleanBairroNome = newBairroNome.trim();
-    const taxaVal = parseNonNegativeMoney(newTaxa);
+    const taxaVal = centsToNumber(newTaxaCents);
 
     if (!cleanCidade) {
       onNotify('err', 'Informe a cidade para cadastrar a área de entrega.');
       return;
     }
-    if (taxaVal === null || Number.isNaN(taxaVal) || taxaVal < 0) {
-      onNotify('err', 'Informe uma taxa válida maior ou igual a 0 (ex: 7,50 ou 0).');
+    if (taxaVal === null || taxaVal < 0) {
+      onNotify('err', 'Informe uma taxa válida maior ou igual a R$ 0,00.');
       return;
     }
 
@@ -396,7 +394,7 @@ export function OwnerDeliveryTab({
         { ...inserted, taxa: Number(inserted.taxa) || 0 },
       ]);
       setNewBairroNome('');
-      setNewTaxa('');
+      setNewTaxaCents(0);
       onNotify('ok', `Área "${label}" adicionada com sucesso!`);
     } catch (err) {
       console.error('Erro ao adicionar área de entrega:', err);
@@ -408,9 +406,9 @@ export function OwnerDeliveryTab({
 
   const handleSaveInlineFee = async (area: BairroEntrega) => {
     if (!supabase) return;
-    const taxaVal = parseNonNegativeMoney(inlineFeeValue);
-    if (taxaVal === null || Number.isNaN(taxaVal) || taxaVal < 0) {
-      onNotify('err', 'Informe uma taxa válida (>= 0).');
+    const taxaVal = centsToNumber(inlineFeeCents);
+    if (taxaVal === null || taxaVal < 0) {
+      onNotify('err', 'Informe uma taxa válida (>= R$ 0,00).');
       return;
     }
 
@@ -446,14 +444,14 @@ export function OwnerDeliveryTab({
 
     const cleanCidade = editCidade.trim();
     const cleanBairroNome = editBairroNome.trim();
-    const taxaVal = parseNonNegativeMoney(editTaxa);
+    const taxaVal = centsToNumber(editTaxaCents);
 
     if (!cleanCidade) {
       onNotify('err', 'A cidade é obrigatória.');
       return;
     }
-    if (taxaVal === null || Number.isNaN(taxaVal) || taxaVal < 0) {
-      onNotify('err', 'Informe uma taxa válida (>= 0).');
+    if (taxaVal === null || taxaVal < 0) {
+      onNotify('err', 'Informe uma taxa válida (>= R$ 0,00).');
       return;
     }
 
@@ -574,9 +572,9 @@ export function OwnerDeliveryTab({
       return;
     }
 
-    const taxaVal = parseNonNegativeMoney(bulkCityFee);
-    if (taxaVal === null || Number.isNaN(taxaVal) || taxaVal < 0) {
-      onNotify('err', 'Informe um valor válido >= 0 para aplicar à cidade.');
+    const taxaVal = centsToNumber(bulkCityFeeCents);
+    if (taxaVal === null || taxaVal < 0) {
+      onNotify('err', 'Informe um valor válido >= R$ 0,00 para aplicar à cidade.');
       return;
     }
 
@@ -609,7 +607,7 @@ export function OwnerDeliveryTab({
       onBairrosChange((prev) =>
         prev.map((item) => updatedMap.get(item.id) || item)
       );
-      setBulkCityFee('');
+      setBulkCityFeeCents(0);
       onNotify(
         'ok',
         `Taxa de ${formatBRL(taxaVal)} aplicada a ${cityAreaIds.length} ${
@@ -669,7 +667,7 @@ export function OwnerDeliveryTab({
           bairroNome: item.name,
           cidade: defaultCity,
           distanciaKm: item.distanciaKm,
-          taxaInput: '0,00',
+          taxaCents: 0,
         };
       });
       setSuggestedBairros(rows);
@@ -708,7 +706,7 @@ export function OwnerDeliveryTab({
           bairroNome: '',
           cidade: item.name,
           distanciaKm: item.distanciaKm,
-          taxaInput: '0,00',
+          taxaCents: 0,
         };
       });
       setSuggestedCidades(rows);
@@ -725,34 +723,21 @@ export function OwnerDeliveryTab({
   };
 
   const handleApplyDistanceTiers = () => {
-    const val0to2 = tier0to2.trim() ? parseNonNegativeMoney(tier0to2) : null;
-    const val2to5 = tier2to5.trim() ? parseNonNegativeMoney(tier2to5) : null;
-    const valAbove5 = tierAbove5.trim() ? parseNonNegativeMoney(tierAbove5) : null;
-
-    if (
-      (tier0to2.trim() && (val0to2 === null || Number.isNaN(val0to2) || val0to2 < 0)) ||
-      (tier2to5.trim() && (val2to5 === null || Number.isNaN(val2to5) || val2to5 < 0)) ||
-      (tierAbove5.trim() && (valAbove5 === null || Number.isNaN(valAbove5) || valAbove5 < 0))
-    ) {
-      onNotify('err', 'Informe valores válidos (>= 0) nas faixas de distância.');
-      return;
-    }
-
-    if (val0to2 === null && val2to5 === null && valAbove5 === null) {
+    if (tier0to2Cents === null && tier2to5Cents === null && tierAbove5Cents === null) {
       onNotify('err', 'Preencha pelo menos uma faixa de distância para aplicar.');
       return;
     }
 
     setSuggestedBairros((prev) =>
       prev.map((row) => {
-        if (row.distanciaKm <= 2 && val0to2 !== null) {
-          return { ...row, taxaInput: formatMoneyInput(val0to2) };
+        if (row.distanciaKm <= 2 && tier0to2Cents !== null) {
+          return { ...row, taxaCents: tier0to2Cents };
         }
-        if (row.distanciaKm > 2 && row.distanciaKm <= 5 && val2to5 !== null) {
-          return { ...row, taxaInput: formatMoneyInput(val2to5) };
+        if (row.distanciaKm > 2 && row.distanciaKm <= 5 && tier2to5Cents !== null) {
+          return { ...row, taxaCents: tier2to5Cents };
         }
-        if (row.distanciaKm > 5 && valAbove5 !== null) {
-          return { ...row, taxaInput: formatMoneyInput(valAbove5) };
+        if (row.distanciaKm > 5 && tierAbove5Cents !== null) {
+          return { ...row, taxaCents: tierAbove5Cents };
         }
         return row;
       })
@@ -808,11 +793,11 @@ export function OwnerDeliveryTab({
         return;
       }
 
-      const taxaVal = parseNonNegativeMoney(row.taxaInput);
-      if (taxaVal === null || Number.isNaN(taxaVal) || taxaVal < 0) {
+      const taxaVal = centsToNumber(row.taxaCents);
+      if (taxaVal === null || taxaVal < 0) {
         onNotify(
           'err',
-          `Taxa inválida para "${formatAreaLabel(cleanCidade, cleanBairro)}". Use número >= 0.`
+          `Taxa inválida para "${formatAreaLabel(cleanCidade, cleanBairro)}".`
         );
         return;
       }
@@ -996,12 +981,11 @@ export function OwnerDeliveryTab({
               <label htmlFor="del-taxa-fixa" className="block text-xs font-semibold text-slate-700 mb-1">
                 Taxa única de entrega (R$)
               </label>
-              <input
+              <CurrencyInput
                 id="del-taxa-fixa"
-                type="text"
-                value={delTaxaFixa}
-                onChange={(e) => setDelTaxaFixa(e.target.value)}
-                placeholder="6,00"
+                valueCents={delTaxaFixaCents}
+                onChangeCents={(c) => setDelTaxaFixaCents(c ?? 0)}
+                placeholder="R$ 6,00"
                 className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-200 text-sm tabular-nums"
               />
             </div>
@@ -1014,12 +998,12 @@ export function OwnerDeliveryTab({
             <label htmlFor="del-frete-gratis" className="block text-xs font-semibold text-slate-700 mb-1">
               Frete grátis acima de (R$)
             </label>
-            <input
+            <CurrencyInput
               id="del-frete-gratis"
-              type="text"
-              value={delFreteGratis}
-              onChange={(e) => setDelFreteGratis(e.target.value)}
-              placeholder="Opcional (ex: 80,00)"
+              allowEmpty
+              valueCents={delFreteGratisCents}
+              onChangeCents={setDelFreteGratisCents}
+              placeholder="Opcional (ex: R$ 80,00)"
               className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-200 text-sm tabular-nums"
             />
           </div>
@@ -1028,12 +1012,12 @@ export function OwnerDeliveryTab({
             <label htmlFor="del-pedido-min" className="block text-xs font-semibold text-slate-700 mb-1">
               Pedido mínimo (R$)
             </label>
-            <input
+            <CurrencyInput
               id="del-pedido-min"
-              type="text"
-              value={delPedidoMinimo}
-              onChange={(e) => setDelPedidoMinimo(e.target.value)}
-              placeholder="Opcional (ex: 25,00)"
+              allowEmpty
+              valueCents={delPedidoMinimoCents}
+              onChangeCents={setDelPedidoMinimoCents}
+              placeholder="Opcional (ex: R$ 25,00)"
               className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-200 text-sm tabular-nums"
             />
           </div>
@@ -1237,11 +1221,11 @@ export function OwnerDeliveryTab({
                           <label className="block text-[11px] font-semibold text-slate-600 mb-1">
                             0–2 km (R$)
                           </label>
-                          <input
-                            type="text"
-                            value={tier0to2}
-                            onChange={(e) => setTier0to2(e.target.value)}
-                            placeholder="5,00"
+                          <CurrencyInput
+                            allowEmpty
+                            valueCents={tier0to2Cents}
+                            onChangeCents={setTier0to2Cents}
+                            placeholder="R$ 5,00"
                             className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs tabular-nums"
                           />
                         </div>
@@ -1249,11 +1233,11 @@ export function OwnerDeliveryTab({
                           <label className="block text-[11px] font-semibold text-slate-600 mb-1">
                             2–5 km (R$)
                           </label>
-                          <input
-                            type="text"
-                            value={tier2to5}
-                            onChange={(e) => setTier2to5(e.target.value)}
-                            placeholder="8,00"
+                          <CurrencyInput
+                            allowEmpty
+                            valueCents={tier2to5Cents}
+                            onChangeCents={setTier2to5Cents}
+                            placeholder="R$ 8,00"
                             className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs tabular-nums"
                           />
                         </div>
@@ -1261,11 +1245,11 @@ export function OwnerDeliveryTab({
                           <label className="block text-[11px] font-semibold text-slate-600 mb-1">
                             Acima de 5 km (R$)
                           </label>
-                          <input
-                            type="text"
-                            value={tierAbove5}
-                            onChange={(e) => setTierAbove5(e.target.value)}
-                            placeholder="12,00"
+                          <CurrencyInput
+                            allowEmpty
+                            valueCents={tierAbove5Cents}
+                            onChangeCents={setTierAbove5Cents}
+                            placeholder="R$ 12,00"
                             className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs tabular-nums"
                           />
                         </div>
@@ -1391,23 +1375,22 @@ export function OwnerDeliveryTab({
                                     className="w-full min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs"
                                   />
                                 </td>
-                                <td className="py-2 px-3 w-28">
-                                  <input
-                                    type="text"
-                                    value={row.taxaInput}
+                                <td className="py-2 px-3 w-32">
+                                  <CurrencyInput
+                                    valueCents={row.taxaCents}
                                     disabled={alreadyExists}
-                                    onChange={(e) =>
+                                    onChangeCents={(cents) =>
                                       setSuggestedBairros((prev) =>
                                         prev.map((item) =>
                                           item.key === row.key
-                                            ? { ...item, taxaInput: e.target.value }
+                                            ? { ...item, taxaCents: cents ?? 0 }
                                             : item
                                         )
                                       )
                                     }
-                                    placeholder="0,00"
+                                    placeholder="R$ 0,00"
                                     aria-label={`Taxa para ${row.bairroNome}`}
-                                    className="w-24 min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs tabular-nums"
+                                    className="w-28 min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs tabular-nums"
                                   />
                                 </td>
                               </tr>
@@ -1514,23 +1497,22 @@ export function OwnerDeliveryTab({
                                 <td className="py-2 px-3 text-slate-600 tabular-nums whitespace-nowrap">
                                   {row.distanciaKm.toFixed(1).replace('.', ',')} km
                                 </td>
-                                <td className="py-2 px-3 w-28">
-                                  <input
-                                    type="text"
-                                    value={row.taxaInput}
+                                <td className="py-2 px-3 w-32">
+                                  <CurrencyInput
+                                    valueCents={row.taxaCents}
                                     disabled={alreadyExists}
-                                    onChange={(e) =>
+                                    onChangeCents={(cents) =>
                                       setSuggestedCidades((prev) =>
                                         prev.map((item) =>
                                           item.key === row.key
-                                            ? { ...item, taxaInput: e.target.value }
+                                            ? { ...item, taxaCents: cents ?? 0 }
                                             : item
                                         )
                                       )
                                     }
-                                    placeholder="0,00"
+                                    placeholder="R$ 0,00"
                                     aria-label={`Taxa para ${row.cidade}`}
-                                    className="w-24 min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs tabular-nums"
+                                    className="w-28 min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs tabular-nums"
                                   />
                                 </td>
                               </tr>
@@ -1635,14 +1617,13 @@ export function OwnerDeliveryTab({
                   <label htmlFor="area-taxa" className="block text-xs font-semibold text-slate-700 mb-1">
                     Taxa (R$) *
                   </label>
-                  <input
+                  <CurrencyInput
                     id="area-taxa"
-                    type="text"
                     required
-                    value={newTaxa}
-                    onChange={(e) => setNewTaxa(e.target.value)}
-                    placeholder="7,50 ou 0"
-                    className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-200 text-sm tabular-nums"
+                    valueCents={newTaxaCents}
+                    onChangeCents={(c) => setNewTaxaCents(c ?? 0)}
+                    placeholder="R$ 0,00"
+                    className="w-full min-h-[44px] px-3 py-2 rounded-xl border border-slate-200 text-sm tabular-nums"
                   />
                 </div>
 
@@ -1787,12 +1768,11 @@ export function OwnerDeliveryTab({
                     ))}
                   </select>
 
-                  <input
-                    type="text"
+                  <CurrencyInput
                     required
-                    value={bulkCityFee}
-                    onChange={(e) => setBulkCityFee(e.target.value)}
-                    placeholder="Novo valor R$ (ex: 8,00 ou 0)"
+                    valueCents={bulkCityFeeCents}
+                    onChangeCents={(c) => setBulkCityFeeCents(c ?? 0)}
+                    placeholder="Novo valor (ex: R$ 8,00)"
                     aria-label="Novo valor da taxa para a cidade"
                     className="sm:col-span-4 min-h-[42px] px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm tabular-nums"
                   />
@@ -1903,13 +1883,12 @@ export function OwnerDeliveryTab({
                                         aria-label="Editar bairro"
                                         className="flex-1 min-w-[140px] min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm"
                                       />
-                                      <input
-                                        type="text"
-                                        value={editTaxa}
-                                        onChange={(e) => setEditTaxa(e.target.value)}
-                                        placeholder="Taxa R$"
+                                      <CurrencyInput
+                                        valueCents={editTaxaCents}
+                                        onChangeCents={(c) => setEditTaxaCents(c ?? 0)}
+                                        placeholder="R$ 0,00"
                                         aria-label="Editar taxa"
-                                        className="w-24 min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm tabular-nums"
+                                        className="w-28 min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm tabular-nums"
                                       />
                                       <button
                                         type="button"
@@ -1959,11 +1938,10 @@ export function OwnerDeliveryTab({
                                 <td className="py-3 px-4">
                                   {isEditingInlineFee ? (
                                     <div className="inline-flex items-center gap-1.5">
-                                      <input
-                                        type="text"
+                                      <CurrencyInput
                                         autoFocus
-                                        value={inlineFeeValue}
-                                        onChange={(e) => setInlineFeeValue(e.target.value)}
+                                        valueCents={inlineFeeCents}
+                                        onChangeCents={(c) => setInlineFeeCents(c ?? 0)}
                                         onKeyDown={(e) => {
                                           if (e.key === 'Enter') {
                                             e.preventDefault();
@@ -1973,7 +1951,7 @@ export function OwnerDeliveryTab({
                                           }
                                         }}
                                         aria-label={`Taxa inline para ${area.bairro}`}
-                                        className="w-20 min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-300 bg-white text-xs font-semibold tabular-nums"
+                                        className="w-28 min-h-[34px] px-2.5 py-1 rounded-lg border border-slate-300 bg-white text-xs font-semibold tabular-nums"
                                       />
                                       <button
                                         type="button"
@@ -1998,7 +1976,7 @@ export function OwnerDeliveryTab({
                                       type="button"
                                       onClick={() => {
                                         setInlineFeeId(area.id);
-                                        setInlineFeeValue(formatMoneyInput(area.taxa));
+                                        setInlineFeeCents(numberToCents(area.taxa) ?? 0);
                                         setEditingId(null);
                                       }}
                                       title="Clique para editar a taxa rapidamente"
@@ -2040,7 +2018,7 @@ export function OwnerDeliveryTab({
                                           setEditingId(area.id);
                                           setEditCidade(getAreaCidade(area));
                                           setEditBairroNome(getAreaBairroNome(area));
-                                          setEditTaxa(formatMoneyInput(area.taxa));
+                                          setEditTaxaCents(numberToCents(area.taxa) ?? 0);
                                           setInlineFeeId(null);
                                           setConfirmDeleteId(null);
                                         }}

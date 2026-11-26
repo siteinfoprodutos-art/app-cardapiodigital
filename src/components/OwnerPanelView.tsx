@@ -37,12 +37,14 @@ import {
   ALL_THEME_OPTIONS,
   type BairroEntrega,
   type Categoria,
+  centsToNumber,
   DEFAULT_COR_PRIMARIA,
   DEFAULT_COR_SECUNDARIA,
   type Estabelecimento,
   formatBRL,
   getContrastText,
   type ModoEntrega,
+  numberToCents,
   PALETAS_CORES,
   type Pedido,
   type PedidoStatus,
@@ -55,6 +57,7 @@ import {
   validateSlugFormat,
 } from '../types/menu';
 import { cleanCepDigits, formatCepMask } from '../lib/geo';
+import { CurrencyInput } from './CurrencyInput';
 import { ImageWithFallback } from './ImageWithFallback';
 import { OwnerDeliveryTab } from './OwnerDeliveryTab';
 import { OrderPrintReceipt, OwnerOrdersTab } from './OwnerOrdersTab';
@@ -135,19 +138,6 @@ function isNetworkFetchError(err: unknown): boolean {
     lower.includes('network request failed') ||
     lower.includes('load failed')
   );
-}
-
-function parseMoneyField(raw: string): number | null {
-  const cleaned = raw.trim();
-  if (!cleaned) return null;
-  const num = Number(cleaned.replace(/\./g, '').replace(',', '.'));
-  if (!Number.isFinite(num) || num < 0) return NaN;
-  return num;
-}
-
-function formatMoneyField(val?: number | null): string {
-  if (val === null || val === undefined || !Number.isFinite(Number(val))) return '';
-  return Number(val).toFixed(2).replace('.', ',');
 }
 
 function formatWhatsAppMask(raw?: string | null): string {
@@ -251,9 +241,9 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
   const [delAceitaEntrega, setDelAceitaEntrega] = useState(true);
   const [delAceitaRetirada, setDelAceitaRetirada] = useState(true);
   const [delModo, setDelModo] = useState<ModoEntrega>('fixa');
-  const [delTaxaFixa, setDelTaxaFixa] = useState('0,00');
-  const [delFreteGratis, setDelFreteGratis] = useState('');
-  const [delPedidoMinimo, setDelPedidoMinimo] = useState('');
+  const [delTaxaFixaCents, setDelTaxaFixaCents] = useState<number>(0);
+  const [delFreteGratisCents, setDelFreteGratisCents] = useState<number | null>(null);
+  const [delPedidoMinimoCents, setDelPedidoMinimoCents] = useState<number | null>(null);
   const [delTempoEstimado, setDelTempoEstimado] = useState('');
   const [delSaving, setDelSaving] = useState(false);
 
@@ -267,7 +257,7 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
   const [editingProduto, setEditingProduto] = useState<Produto | null>(null);
   const [prodNome, setProdNome] = useState('');
   const [prodDesc, setProdDesc] = useState('');
-  const [prodPreco, setProdPreco] = useState('');
+  const [prodPrecoCents, setProdPrecoCents] = useState<number>(0);
   const [prodCategoriaId, setProdCategoriaId] = useState<string>('');
   const [prodFotoUrl, setProdFotoUrl] = useState('');
   const [prodAtivo, setProdAtivo] = useState(true);
@@ -330,16 +320,16 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
     setDelAceitaEntrega(est.aceita_entrega !== false);
     setDelAceitaRetirada(est.aceita_retirada !== false);
     setDelModo(est.modo_entrega === 'bairro' ? 'bairro' : 'fixa');
-    setDelTaxaFixa(formatMoneyField(est.taxa_entrega ?? 0));
-    setDelFreteGratis(
+    setDelTaxaFixaCents(numberToCents(est.taxa_entrega ?? 0) ?? 0);
+    setDelFreteGratisCents(
       est.entrega_gratis_acima && Number(est.entrega_gratis_acima) > 0
-        ? formatMoneyField(est.entrega_gratis_acima)
-        : ''
+        ? numberToCents(est.entrega_gratis_acima)
+        : null
     );
-    setDelPedidoMinimo(
+    setDelPedidoMinimoCents(
       est.pedido_minimo && Number(est.pedido_minimo) > 0
-        ? formatMoneyField(est.pedido_minimo)
-        : ''
+        ? numberToCents(est.pedido_minimo)
+        : null
     );
     setDelTempoEstimado(est.tempo_estimado || '');
   };
@@ -659,8 +649,11 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
     };
   }, [estabelecimento?.id, fetchPedidos]);
 
-  const handleUpdateOrderStatus = async (pedidoId: string, nextStatus: PedidoStatus) => {
-    if (!supabase) return;
+  const handleUpdateOrderStatus = async (
+    pedidoId: string,
+    nextStatus: PedidoStatus
+  ): Promise<boolean> => {
+    if (!supabase) return false;
     setUpdatingOrderId(pedidoId);
     try {
       const { data, error } = await supabase
@@ -690,19 +683,24 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
           ? `Pedido #${updated.numero} cancelado.`
           : `Status do Pedido #${updated.numero} atualizado.`
       );
+      return true;
     } catch (err) {
       console.error('Erro ao atualizar status do pedido:', err);
       showNotice(
         'err',
         translateSupabaseError(err, 'Erro ao atualizar status do pedido.')
       );
+      return false;
     } finally {
       setUpdatingOrderId(null);
     }
   };
 
-  const handleToggleOrderPaid = async (pedidoId: string, nextPaid: boolean) => {
-    if (!supabase) return;
+  const handleToggleOrderPaid = async (
+    pedidoId: string,
+    nextPaid: boolean
+  ): Promise<boolean> => {
+    if (!supabase) return false;
     setUpdatingOrderId(pedidoId);
     try {
       const { data, error } = await supabase
@@ -722,12 +720,14 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
           ? `Pedido #${updated.numero} marcado como pago.`
           : `Pedido #${updated.numero} marcado como a receber.`
       );
+      return true;
     } catch (err) {
       console.error('Erro ao atualizar pagamento do pedido:', err);
       showNotice(
         'err',
         translateSupabaseError(err, 'Erro ao atualizar pagamento do pedido.')
       );
+      return false;
     } finally {
       setUpdatingOrderId(null);
     }
@@ -1057,23 +1057,14 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
     e.preventDefault();
     if (!supabase || !estabelecimento) return;
 
-    const taxaFixaVal = parseMoneyField(delTaxaFixa);
-    if (delTaxaFixa.trim() !== '' && (taxaFixaVal === null || Number.isNaN(taxaFixaVal))) {
-      showNotice('err', 'Informe uma taxa fixa válida (ex: 6,00).');
+    const taxaFixaVal = centsToNumber(delTaxaFixaCents);
+    if (taxaFixaVal === null || taxaFixaVal < 0) {
+      showNotice('err', 'Informe uma taxa fixa válida.');
       return;
     }
 
-    const freteGratisVal = parseMoneyField(delFreteGratis);
-    if (delFreteGratis.trim() !== '' && (freteGratisVal === null || Number.isNaN(freteGratisVal))) {
-      showNotice('err', 'Informe um valor válido para frete grátis (ex: 80,00).');
-      return;
-    }
-
-    const pedidoMinimoVal = parseMoneyField(delPedidoMinimo);
-    if (delPedidoMinimo.trim() !== '' && (pedidoMinimoVal === null || Number.isNaN(pedidoMinimoVal))) {
-      showNotice('err', 'Informe um valor válido para pedido mínimo (ex: 25,00).');
-      return;
-    }
+    const freteGratisVal = centsToNumber(delFreteGratisCents);
+    const pedidoMinimoVal = centsToNumber(delPedidoMinimoCents);
 
     setDelSaving(true);
     setFeedback(null);
@@ -1085,7 +1076,7 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
           aceita_entrega: delAceitaEntrega,
           aceita_retirada: delAceitaRetirada,
           modo_entrega: delModo,
-          taxa_entrega: taxaFixaVal ?? 0,
+          taxa_entrega: taxaFixaVal,
           entrega_gratis_acima: freteGratisVal && freteGratisVal > 0 ? freteGratisVal : null,
           pedido_minimo: pedidoMinimoVal && pedidoMinimoVal > 0 ? pedidoMinimoVal : null,
           tempo_estimado: delTempoEstimado.trim() || null,
@@ -1369,7 +1360,7 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
     setEditingProduto(null);
     setProdNome('');
     setProdDesc('');
-    setProdPreco('');
+    setProdPrecoCents(0);
     setProdCategoriaId(categorias[0]?.id || '');
     setProdFotoUrl('');
     setProdAtivo(true);
@@ -1380,7 +1371,7 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
     setEditingProduto(prod);
     setProdNome(prod.nome);
     setProdDesc(prod.descricao || '');
-    setProdPreco(String(prod.preco.toFixed(2)).replace('.', ','));
+    setProdPrecoCents(numberToCents(prod.preco) ?? 0);
     setProdCategoriaId(prod.categoria_id || '');
     setProdFotoUrl(prod.foto_url || '');
     setProdAtivo(prod.ativo);
@@ -1417,13 +1408,13 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
     if (!supabase || !estabelecimento) return;
 
     const cleanNome = prodNome.trim();
-    const numericPreco = Number(prodPreco.replace(/\./g, '').replace(',', '.'));
+    const numericPreco = centsToNumber(prodPrecoCents);
     if (!cleanNome) {
       showNotice('err', 'Informe o nome do produto.');
       return;
     }
-    if (!Number.isFinite(numericPreco) || numericPreco < 0) {
-      showNotice('err', 'Informe um preço válido (ex: 29,90).');
+    if (numericPreco === null || numericPreco < 0) {
+      showNotice('err', 'Informe um preço válido.');
       return;
     }
 
@@ -2438,12 +2429,12 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
             setDelAceitaRetirada={setDelAceitaRetirada}
             delModo={delModo}
             setDelModo={setDelModo}
-            delTaxaFixa={delTaxaFixa}
-            setDelTaxaFixa={setDelTaxaFixa}
-            delFreteGratis={delFreteGratis}
-            setDelFreteGratis={setDelFreteGratis}
-            delPedidoMinimo={delPedidoMinimo}
-            setDelPedidoMinimo={setDelPedidoMinimo}
+            delTaxaFixaCents={delTaxaFixaCents}
+            setDelTaxaFixaCents={setDelTaxaFixaCents}
+            delFreteGratisCents={delFreteGratisCents}
+            setDelFreteGratisCents={setDelFreteGratisCents}
+            delPedidoMinimoCents={delPedidoMinimoCents}
+            setDelPedidoMinimoCents={setDelPedidoMinimoCents}
             delTempoEstimado={delTempoEstimado}
             setDelTempoEstimado={setDelTempoEstimado}
             delSaving={delSaving}
@@ -3003,13 +2994,12 @@ export function OwnerPanelView({ onNavigate }: OwnerPanelViewProps) {
                 <label htmlFor="p-preco" className="block text-xs font-semibold text-slate-700 mb-1">
                   Preço (R$) *
                 </label>
-                <input
+                <CurrencyInput
                   id="p-preco"
-                  type="text"
                   required
-                  value={prodPreco}
-                  onChange={(e) => setProdPreco(e.target.value)}
-                  placeholder="34,90"
+                  valueCents={prodPrecoCents}
+                  onChangeCents={(c) => setProdPrecoCents(c ?? 0)}
+                  placeholder="R$ 34,90"
                   className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-200 text-sm tabular-nums"
                 />
               </div>

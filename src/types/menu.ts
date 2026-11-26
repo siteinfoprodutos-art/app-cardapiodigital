@@ -134,6 +134,7 @@ export type FormaPagamento = 'na_entrega' | 'pix' | 'link';
 export type PedidoStatus =
   | 'novo'
   | 'em_preparo'
+  | 'pronto'
   | 'saiu_entrega'
   | 'pronto_retirada'
   | 'entregue'
@@ -156,6 +157,7 @@ export interface Pedido {
   id: string;
   estabelecimento_id: string;
   numero: number;
+  token?: string | null;
   cliente: string;
   telefone: string | null;
   tipo: TipoEntrega;
@@ -169,16 +171,56 @@ export interface Pedido {
   total: number;
   status: PedidoStatus | string;
   pago: boolean;
+  comprovante_path?: string | null;
+  comprovante_enviado?: boolean | null;
   created_at: string;
 }
 
 export interface CriarPedidoResult {
   id?: string;
   numero: number;
+  token?: string | null;
   subtotal: number;
   taxa_entrega: number;
   total: number;
   itens: PedidoItem[];
+}
+
+export interface PedidoEvento {
+  tipo: string;
+  created_at?: string | null;
+}
+
+export interface OrderTrackingLoja {
+  nome: string;
+  slug?: string | null;
+  whatsapp?: string | null;
+  chave_pix?: string | null;
+  logo_url?: string | null;
+  tema?: ThemeId | string | null;
+  cor_primaria?: string | null;
+  cor_secundaria?: string | null;
+}
+
+export interface OrderTrackingData {
+  numero: number;
+  token: string;
+  cliente?: string | null;
+  tipo: TipoEntrega;
+  endereco?: string | null;
+  bairro?: string | null;
+  forma_pagamento: FormaPagamento | string;
+  obs?: string | null;
+  itens: PedidoItem[];
+  subtotal: number;
+  taxa_entrega: number;
+  total: number;
+  status: PedidoStatus | string;
+  pago: boolean;
+  comprovante_enviado: boolean;
+  created_at: string;
+  loja: OrderTrackingLoja;
+  eventos: PedidoEvento[];
 }
 
 export const DEFAULT_COR_PRIMARIA = '#E63946';
@@ -381,7 +423,11 @@ export const THEME_PRESETS: Record<Exclude<ThemeId, 'personalizado'>, ThemeToken
 };
 
 export function resolveStoreTheme(
-  est?: Pick<Estabelecimento, 'tema' | 'cor_primaria' | 'cor_secundaria'> | null
+  est?: {
+    tema?: ThemeId | string | null;
+    cor_primaria?: string | null;
+    cor_secundaria?: string | null;
+  } | null
 ): ThemeTokens {
   const rawTema = est?.tema as ThemeId | undefined | null;
 
@@ -521,7 +567,7 @@ export function parseOpeningStatus(horario?: string | null): 'open' | 'closed' |
   }
 }
 
-export const FORBIDDEN_SLUGS = ['painel', 'cadastro', 'admin', 'login', 'api', 'assets'];
+export const FORBIDDEN_SLUGS = ['painel', 'cadastro', 'admin', 'login', 'api', 'assets', 'pedido'];
 
 export function slugify(input: string): string {
   return input
@@ -576,6 +622,26 @@ export function formatBRL(value: number): string {
     style: 'currency',
     currency: 'BRL',
   }).format(Number.isFinite(value) ? value : 0);
+}
+
+export function numberToCents(value?: number | null): number | null {
+  if (value === null || value === undefined) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return null;
+  return Math.round(num * 100);
+}
+
+export function centsToNumber(cents?: number | null): number | null {
+  if (cents === null || cents === undefined) return null;
+  if (!Number.isFinite(cents) || cents < 0) return null;
+  return Math.round(cents) / 100;
+}
+
+export function formatCentsToBRL(cents?: number | null): string {
+  if (cents === null || cents === undefined || !Number.isFinite(cents)) {
+    return '';
+  }
+  return formatBRL(Math.max(0, Math.round(cents)) / 100);
 }
 
 export function sanitizeExternalUrl(url: string): string | null {
@@ -697,6 +763,7 @@ export function buildWhatsAppOrderUrl(params: {
   enderecoTexto?: string;
   obsPedido?: string;
   formaPagamento: FormaPagamento;
+  trackingUrl?: string | null;
 }): string | null {
   const digits = normalizeWhatsAppDigits(params.whatsapp);
   if (!digits) return null;
@@ -767,8 +834,72 @@ export function buildWhatsAppOrderUrl(params: {
   lines.push(`*Total:* ${formatBRL(params.total)}`);
   lines.push(`*Pagamento:* ${labelPagamento}`);
 
+  if (params.trackingUrl && params.trackingUrl.trim()) {
+    lines.push('');
+    lines.push(`Acompanhe seu pedido: ${params.trackingUrl.trim()}`);
+  }
+
   const texto = lines.join('\n');
   return `https://wa.me/${digits}?text=${encodeURIComponent(texto)}`;
+}
+
+export type WhatsAppNotifyStage = PedidoStatus | 'pago';
+
+export function buildCustomerStageWhatsAppUrl(params: {
+  telefone?: string | null;
+  clienteNome: string;
+  numero: number;
+  estabelecimentoNome: string;
+  stage: WhatsAppNotifyStage | string;
+  token?: string | null;
+  origin?: string;
+}): string | null {
+  const digits = normalizeWhatsAppDigits(params.telefone || '');
+  if (!digits) return null;
+
+  const nome = (params.clienteNome || 'cliente').trim();
+  const num = params.numero;
+  const loja = (params.estabelecimentoNome || 'nossa loja').trim();
+
+  let message: string;
+  switch (params.stage) {
+    case 'novo':
+      message = `Olá, ${nome}! Recebemos seu pedido #${num} na ${loja}.`;
+      break;
+    case 'pago':
+      message = `Pagamento do pedido #${num} confirmado. Obrigado!`;
+      break;
+    case 'em_preparo':
+      message = `Seu pedido #${num} está em preparação.`;
+      break;
+    case 'pronto':
+      message = `Seu pedido #${num} está pronto.`;
+      break;
+    case 'saiu_entrega':
+      message = `Seu pedido #${num} saiu para entrega.`;
+      break;
+    case 'pronto_retirada':
+      message = `Seu pedido #${num} está pronto para retirada.`;
+      break;
+    case 'entregue':
+      message = `Pedido #${num} finalizado. Obrigado pela preferência!`;
+      break;
+    case 'cancelado':
+      message = `Pedido #${num} foi cancelado. Qualquer dúvida, fale com a gente.`;
+      break;
+    default:
+      message = `Atualização do seu pedido #${num} na ${loja}.`;
+      break;
+  }
+
+  const baseOrigin =
+    params.origin || (typeof window !== 'undefined' ? window.location.origin : '');
+  const trackingLine =
+    params.token && params.token.trim() && baseOrigin
+      ? `\n\nAcompanhe: ${baseOrigin}/pedido/${params.token.trim()}`
+      : '';
+
+  return `https://wa.me/${digits}?text=${encodeURIComponent(`${message}${trackingLine}`)}`;
 }
 
 export function formatStoreAddress(

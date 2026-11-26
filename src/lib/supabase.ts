@@ -18,6 +18,7 @@ export const supabase: SupabaseClient | null = isSupabaseConfigured
   : null;
 
 export const STORAGE_BUCKET = 'cardapio';
+export const COMPROVANTES_BUCKET = 'comprovantes';
 
 export interface ProcessImageOptions {
   maxWidth?: number;
@@ -26,43 +27,42 @@ export interface ProcessImageOptions {
   appendCacheBuster?: boolean;
 }
 
-function canvasToWebpBlob(
+function canvasToBlob(
   canvas: HTMLCanvasElement,
+  mimeType: string,
   quality: number
-): Promise<Blob> {
-  return new Promise((resolve, reject) => {
+): Promise<Blob | null> {
+  return new Promise((resolve) => {
     canvas.toBlob(
       (blob) => {
-        if (blob) resolve(blob);
-        else reject(new Error('Falha na conversão para WebP.'));
+        resolve(blob);
       },
-      'image/webp',
+      mimeType,
       quality
     );
   });
 }
 
-/**
- * Redimensiona imagem no navegador respeitando largura/altura máxima,
- * comprime em WebP abaixo de maxBytes (padrão 450 KB) e faz upload no bucket 'cardapio'.
- */
-export async function processAndUploadImage(
-  file: File,
-  storagePath: string,
-  options: ProcessImageOptions = {}
-): Promise<string> {
-  if (!supabase) {
-    throw new Error('Supabase não está configurado.');
-  }
+async function canvasToWebpBlob(
+  canvas: HTMLCanvasElement,
+  quality: number
+): Promise<Blob> {
+  const webp = await canvasToBlob(canvas, 'image/webp', quality);
+  if (webp) return webp;
+  const jpeg = await canvasToBlob(canvas, 'image/jpeg', quality);
+  if (jpeg) return jpeg;
+  throw new Error('Falha na conversão da imagem.');
+}
 
+async function compressImageFile(
+  file: File,
+  maxWidth: number,
+  maxHeight: number,
+  maxBytes: number
+): Promise<{ blob: Blob; ext: 'webp' | 'jpg'; contentType: string }> {
   if (!file.type.startsWith('image/')) {
     throw new Error('O arquivo enviado não é uma imagem válida.');
   }
-
-  const maxWidth = options.maxWidth ?? 1000;
-  const maxHeight = options.maxHeight ?? maxWidth;
-  const maxBytes = options.maxBytes ?? 450 * 1024;
-  const appendCacheBuster = options.appendCacheBuster ?? true;
 
   const loadedImg = await new Promise<HTMLImageElement>((resolve, reject) => {
     const reader = new FileReader();
@@ -97,34 +97,60 @@ export async function processAndUploadImage(
   }
   ctx.drawImage(loadedImg, 0, 0, canvas.width, canvas.height);
 
-  // Tenta comprimir progressivamente para garantir tamanho abaixo de 450 KB
   const qualities = [0.84, 0.72, 0.58, 0.45, 0.34];
-  let webpBlob = await canvasToWebpBlob(canvas, qualities[0]);
+  let blob = await canvasToWebpBlob(canvas, qualities[0]);
 
-  for (let i = 1; i < qualities.length && webpBlob.size > maxBytes; i++) {
-    webpBlob = await canvasToWebpBlob(canvas, qualities[i]);
+  for (let i = 1; i < qualities.length && blob.size > maxBytes; i++) {
+    blob = await canvasToWebpBlob(canvas, qualities[i]);
   }
 
-  // Se ainda exceder maxBytes, reduz escala em 20%
   let scaleAttempts = 0;
-  while (webpBlob.size > maxBytes && scaleAttempts < 2) {
+  while (blob.size > maxBytes && scaleAttempts < 3) {
     scaleAttempts++;
-    const nextW = Math.max(120, Math.round(canvas.width * 0.8));
-    const nextH = Math.max(120, Math.round(canvas.height * 0.8));
+    const nextW = Math.max(120, Math.round(canvas.width * 0.75));
+    const nextH = Math.max(120, Math.round(canvas.height * 0.75));
     canvas.width = nextW;
     canvas.height = nextH;
     const retryCtx = canvas.getContext('2d');
     if (!retryCtx) break;
     retryCtx.drawImage(loadedImg, 0, 0, nextW, nextH);
-    webpBlob = await canvasToWebpBlob(canvas, 0.5);
+    blob = await canvasToWebpBlob(canvas, 0.5);
   }
+
+  const isWebp = blob.type === 'image/webp';
+  return {
+    blob,
+    ext: isWebp ? 'webp' : 'jpg',
+    contentType: isWebp ? 'image/webp' : 'image/jpeg',
+  };
+}
+
+/**
+ * Redimensiona imagem no navegador respeitando largura/altura máxima,
+ * comprime em WebP abaixo de maxBytes (padrão 450 KB) e faz upload no bucket 'cardapio'.
+ */
+export async function processAndUploadImage(
+  file: File,
+  storagePath: string,
+  options: ProcessImageOptions = {}
+): Promise<string> {
+  if (!supabase) {
+    throw new Error('Supabase não está configurado.');
+  }
+
+  const maxWidth = options.maxWidth ?? 1000;
+  const maxHeight = options.maxHeight ?? maxWidth;
+  const maxBytes = options.maxBytes ?? 450 * 1024;
+  const appendCacheBuster = options.appendCacheBuster ?? true;
+
+  const { blob, contentType } = await compressImageFile(file, maxWidth, maxHeight, maxBytes);
 
   const { error: uploadError } = await supabase.storage
     .from(STORAGE_BUCKET)
-    .upload(storagePath, webpBlob, {
+    .upload(storagePath, blob, {
       cacheControl: '3600',
       upsert: true,
-      contentType: 'image/webp',
+      contentType,
     });
 
   if (uploadError) {
@@ -142,6 +168,74 @@ export async function processAndUploadImage(
   }
 
   return data.publicUrl;
+}
+
+/**
+ * Comprime comprovante do Pix (largura máx. 1280px, < 500 KB) e envia para o bucket privado 'comprovantes'.
+ */
+export async function uploadPixReceipt(
+  file: File,
+  token: string
+): Promise<{ path: string }> {
+  if (!supabase) {
+    throw new Error('Conexão com o servidor indisponível.');
+  }
+
+  const cleanToken = token.trim();
+  if (!cleanToken) {
+    throw new Error('Identificador do pedido inválido.');
+  }
+
+  const maxBytes = 500 * 1024;
+  const { blob, ext, contentType } = await compressImageFile(file, 1280, 2560, maxBytes);
+
+  if (blob.size > maxBytes) {
+    throw new Error('A imagem ficou acima de 500 KB mesmo comprimida. Envie uma foto menor.');
+  }
+
+  const storagePath = `${cleanToken}/${Date.now()}.${ext}`;
+  const { error: uploadError } = await supabase.storage
+    .from(COMPROVANTES_BUCKET)
+    .upload(storagePath, blob, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType,
+    });
+
+  if (uploadError) {
+    console.error('Erro no upload do comprovante:', uploadError);
+    throw new Error(
+      translateSupabaseError(uploadError, 'Não foi possível enviar o comprovante. Tente novamente.')
+    );
+  }
+
+  return { path: storagePath };
+}
+
+export async function createComprovanteSignedUrl(
+  storagePath: string,
+  expiresInSeconds = 300
+): Promise<string> {
+  if (!supabase) {
+    throw new Error('Supabase não está configurado.');
+  }
+  const cleanPath = storagePath.trim();
+  if (!cleanPath) {
+    throw new Error('Caminho do comprovante não encontrado.');
+  }
+
+  const { data, error } = await supabase.storage
+    .from(COMPROVANTES_BUCKET)
+    .createSignedUrl(cleanPath, expiresInSeconds);
+
+  if (error || !data?.signedUrl) {
+    console.error('Erro ao gerar URL assinada do comprovante:', error);
+    throw new Error(
+      translateSupabaseError(error, 'Não foi possível abrir o comprovante agora.')
+    );
+  }
+
+  return data.signedUrl;
 }
 
 export async function deleteStoragePhoto(publicUrl: string): Promise<void> {
