@@ -1,0 +1,6 @@
+{
+  "name": "Cardápio Digital",
+  "description": "Cardápio digital responsivo mobile-first com pedidos via WhatsApp, Pix, painel do dono com Supabase Auth, Storage e QR Code.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
